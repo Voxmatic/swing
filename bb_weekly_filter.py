@@ -1,10 +1,14 @@
 import yfinance as yf
 
 
-def passes_weekly_bb(symbol, tolerance=0.005):
+def passes_weekly_bb(symbol, tolerance=0.03):
     """
-    Bullish Bollinger filter:
-    Only LOWER band proximity is valid
+    Bullish Bollinger filter (WEEKLY)
+
+    Pass when price is:
+    - below middle band
+    - near lower band
+    - below lower band
     """
 
     try:
@@ -23,12 +27,29 @@ def passes_weekly_bb(symbol, tolerance=0.005):
 
     close = df["Close"].squeeze()
 
-    ma = close.rolling(20).mean()
+    middle = close.rolling(20).mean()
     std = close.rolling(20).std()
 
-    lower = ma - 2 * std
+    lower = middle - 2 * std
 
     last_close = float(close.iloc[-1])
+    last_middle = float(middle.iloc[-1])
     last_lower = float(lower.iloc[-1])
 
-    return last_close <= last_lower * (1 + tolerance)
+    # ---------------------------------
+    # ✅ NEW SMART BB CONDITIONS
+    # ---------------------------------
+
+    # 1️⃣ Between middle → lower (pullback zone)
+    if last_close <= last_middle:
+        return True
+
+    # 2️⃣ Near lower band
+    if last_close <= last_lower * (1 + tolerance):
+        return True
+
+    # 3️⃣ Breakdown below lower band
+    if last_close < last_lower:
+        return True
+
+    return False
