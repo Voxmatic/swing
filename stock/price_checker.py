@@ -1,12 +1,21 @@
-import yfinance as yf
+from tvDatafeed import TvDatafeed, Interval
+
+tv = TvDatafeed()   # anonymous login works fine
 
 def get_price(symbol):
-    if not symbol.endswith(".NS"):
-        symbol += ".NS"
+    try:
+        # NSE symbols on TradingView use NSE:
+        data = tv.get_hist(
+            symbol=symbol,
+            exchange="NSE",
+            interval=Interval.in_1_minute,
+            n_bars=1
+        )
 
-    data = yf.Ticker(symbol).history(period="1d", interval="1m")
+        if data is None or data.empty:
+            return None
 
-    if data.empty:
+        return float(data["close"].iloc[-1])
+
+    except Exception as e:
         return None
-
-    return float(data["Close"].iloc[-1])
