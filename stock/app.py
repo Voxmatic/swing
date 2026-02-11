@@ -1,164 +1,237 @@
 import streamlit as st
-import database
-from price_checker import get_price
-from streamlit_autorefresh import st_autorefresh
+import sqlite3
 import pandas as pd
+from tvDatafeed import TvDatafeed, Interval
 
-st_autorefresh(interval=15000, key="refresh")
+# =========================
+# CONFIG
+# =========================
 
-st.set_page_config("📈 Trading Terminal", layout="wide")
+st.set_page_config("Kite Style Trading Portal", layout="wide")
 
-# ------------------ UI THEME ------------------
-st.markdown("""
-<style>
-html, body {background:#0b1220;color:white;}
-.stMetric {background:#111827;padding:15px;border-radius:12px;}
-.stDataFrame {border-radius:12px;}
-h1,h2,h3 {color:#e5e7eb;}
-</style>
-""", unsafe_allow_html=True)
+tv = TvDatafeed(username=None, password=None)
 
-database.create_table()
-conn = database.connect()
+# =========================
+# DATABASE
+# =========================
+
+conn = sqlite3.connect("trades.db", check_same_thread=False)
 c = conn.cursor()
 
-st.title("📊 Pro Trade Terminal")
-
-# ================= RISK PANEL =================
-
-st.subheader("🧠 Risk Management")
-
-col1,col2,col3 = st.columns(3)
-
-capital = col1.number_input("Total Capital ₹", value=100000.0)
-risk_pct = col2.number_input("Risk Per Trade %", value=1.0)
-risk_amount = capital * (risk_pct/100)
-
-col3.metric("Risk ₹ Per Trade", round(risk_amount,2))
-
-st.divider()
-
-# ================= ADD TRADE =================
-
-with st.form("trade_form"):
-    stock = st.text_input("Stock (RELIANCE, TCS, INFY)")
-    buy = st.number_input("Buy Trigger", min_value=0.0)
-    sl = st.number_input("Stoploss", min_value=0.0)
-    target = st.number_input("Target", min_value=0.0)
-    submit = st.form_submit_button("Add Trade")
-
-if submit:
-    c.execute("INSERT INTO trades VALUES (NULL,?,?,?,?,?)",
-              (stock.upper(), buy, sl, target, "Pending"))
-    conn.commit()
-    st.success("Trade Added")
-
-st.divider()
-
-# ================= LOAD TRADES =================
-
-c.execute("SELECT * FROM trades")
-trades = c.fetchall()
-
-pending, active, target_hit, sl_hit = [], [], [], []
-positions = []
-total_pl = 0
-
-# ================= LOGIC =================
-
-for t in trades:
-    trade_id, stock, buy, sl, target, status = t
-    price = get_price(stock)
-
-    if price is None:
-        continue
-
-    # ---- Position sizing ----
-    risk_per_share = abs(buy - sl)
-    qty = int(risk_amount / risk_per_share) if risk_per_share else 0
-    reward_risk = round((target - buy) / risk_per_share, 2) if risk_per_share else 0
-
-    # ---- Entry not hit ----
-    if price < buy:
-        pending.append({
-            "Stock":stock,
-            "Buy":buy,
-            "Current":round(price,2),
-            "Qty":qty,
-            "R:R":reward_risk
-        })
-        continue
-
-    # ---- Active P/L ----
-    pl = round((price - buy) * qty, 2)
-    total_pl += pl
-
-    row = {
-        "Stock":stock,
-        "Qty":qty,
-        "Buy":buy,
-        "Current":round(price,2),
-        "P/L ₹":pl,
-        "R:R":reward_risk
-    }
-
-    positions.append(row)
-
-    if price >= target:
-        target_hit.append(row)
-        status = "Target Hit"
-    elif price <= sl:
-        sl_hit.append(row)
-        status = "SL Hit"
-    else:
-        active.append(row)
-        status = "Active"
-
-    c.execute("UPDATE trades SET status=? WHERE id=?", (status, trade_id))
-
+c.execute("""
+CREATE TABLE IF NOT EXISTS trades (
+id INTEGER PRIMARY KEY,
+symbol TEXT,
+buy REAL,
+sl REAL,
+target REAL,
+status TEXT,
+entry_triggered INTEGER
+)
+""")
 conn.commit()
 
-df = pd.DataFrame(positions)
+# =========================
+# ACCURATE LTP
+# =========================
 
-# ================= KPI BAR =================
+def get_price(symbol):
+    try:
+        df = tv.get_hist(
+            symbol=symbol,
+            exchange="NSE",
+            interval=Interval.in_1_minute,
+            n_bars=3
+        )
+        return round(float(df["close"].iloc[-1]), 2)
+    except:
+        return None
 
-st.subheader("📊 Portfolio Overview")
+# =========================
+# UPDATE STATUS
+# =========================
 
-a,b,c1,d,e = st.columns(5)
-a.metric("Active", len(active))
-b.metric("Pending", len(pending))
-c1.metric("Target Hit", len(target_hit))
-d.metric("SL Hit", len(sl_hit))
-e.metric("Net P/L ₹", round(total_pl,2))
+def update_trades():
+    rows = c.execute("SELECT * FROM trades").fetchall()
 
-st.divider()
+    for r in rows:
+        id, sym, buy, sl, tgt, status, triggered = r
+        price = get_price(sym)
 
-# ================= COLOR TABLE =================
+        if price is None:
+            continue
 
-def color(val):
-    if isinstance(val,(int,float)):
-        if val > 0: return "color:#22c55e;font-weight:bold"
-        if val < 0: return "color:#ef4444;font-weight:bold"
-    return ""
+        if not triggered and price >= buy:
+            c.execute(
+                "UPDATE trades SET entry_triggered=1,status='ACTIVE' WHERE id=?",
+                (id,)
+            )
 
-# ================= TABS =================
+        elif triggered:
+            if price >= tgt:
+                c.execute("UPDATE trades SET status='TARGET HIT' WHERE id=?", (id,))
+            elif price <= sl:
+                c.execute("UPDATE trades SET status='STOPLOSS HIT' WHERE id=?", (id,))
 
-tabs = st.tabs(["📈 Positions","🟡 Pending","🟢 Active","🎯 Target Hit","🔴 Stoploss Hit"])
+    conn.commit()
 
-with tabs[0]:
-    if not df.empty:
-        st.dataframe(df.style.applymap(color, subset=["P/L ₹"]), use_container_width=True)
+# =========================
+# EDIT & DELETE
+# =========================
 
-with tabs[1]:
-    st.dataframe(pd.DataFrame(pending), use_container_width=True)
+def delete_trade(tid):
+    c.execute("DELETE FROM trades WHERE id=?", (tid,))
+    conn.commit()
+    st.experimental_rerun()
 
-with tabs[2]:
-    st.dataframe(pd.DataFrame(active), use_container_width=True)
+def update_trade(tid, buy, sl, target):
+    c.execute(
+        "UPDATE trades SET buy=?, sl=?, target=? WHERE id=?",
+        (buy, sl, target, tid)
+    )
+    conn.commit()
+    st.experimental_rerun()
 
-with tabs[3]:
-    st.dataframe(pd.DataFrame(target_hit), use_container_width=True)
+# =========================
+# KITE STYLE CARD
+# =========================
+
+def trade_card(row):
+
+    ltp = get_price(row.symbol)
+    if ltp is None:
+        st.warning("Price unavailable")
+        return
+
+    pnl = round(ltp - row.buy, 2)
+    color = "#00c853" if pnl >= 0 else "#ff5252"
+
+    st.markdown(f"""
+    <div style="
+    background:white;
+    padding:16px;
+    border-radius:14px;
+    box-shadow:0 4px 15px rgba(0,0,0,0.12);
+    margin-bottom:12px;">
+        <h3>{row.symbol}</h3>
+        <b>LTP:</b> {ltp}<br>
+        <b>BUY:</b> {row.buy}<br>
+        <b style="color:{color};font-size:18px;">P&L: {pnl}</b><br>
+        🎯 {row.target} &nbsp;&nbsp; ❌ {row.sl}
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("✏️ Edit", key=f"edit{row.id}"):
+            st.session_state["edit"] = row.id
+
+    with c2:
+        if st.button("🗑 Delete", key=f"del{row.id}"):
+            delete_trade(row.id)
+
+    if st.session_state.get("edit") == row.id:
+        with st.form(f"editform{row.id}"):
+            nb = st.number_input("New Buy", value=float(row.buy))
+            ns = st.number_input("New Stoploss", value=float(row.sl))
+            nt = st.number_input("New Target", value=float(row.target))
+            save = st.form_submit_button("Save Changes")
+
+            if save:
+                update_trade(row.id, nb, ns, nt)
+
+# =========================
+# HEADER
+# =========================
+
+st.title("📈 Zerodha Kite-Style Trading Portal")
+
+# =========================
+# REFRESH BUTTON
+# =========================
+
+if st.button("🔄 Refresh Prices & Update Trades"):
+    update_trades()
+    st.experimental_rerun()
+
+# =========================
+# ADD TRADE
+# =========================
+
+with st.form("add_trade"):
+    a, b, c_, d = st.columns(4)
+
+    sym = a.text_input("Stock (NSE)", placeholder="RELIANCE")
+    buy = b.number_input("Buy Price", step=0.1)
+    sl = c_.number_input("Stoploss", step=0.1)
+    tgt = d.number_input("Target", step=0.1)
+
+    submit = st.form_submit_button("➕ Add Trade")
+
+    if submit:
+        c.execute(
+            "INSERT INTO trades VALUES (NULL,?,?,?,?,?,?)",
+            (sym, buy, sl, tgt, "PENDING", 0)
+        )
+        conn.commit()
+        st.success("Trade added!")
+
+# =========================
+# TABS
+# =========================
+
+tabs = st.tabs([
+    "🕒 Pending",
+    "📊 Active",
+    "🎯 Target Hit",
+    "❌ Stoploss Hit",
+    "📈 Analytics"
+])
+
+def show(status):
+    df = pd.read_sql(
+        f"SELECT * FROM trades WHERE status='{status}'",
+        conn
+    )
+
+    if df.empty:
+        st.info("No trades here")
+        return
+
+    cols = st.columns(2)
+
+    for i, row in df.iterrows():
+        with cols[i % 2]:
+            trade_card(row)
+
+with tabs[0]: show("PENDING")
+with tabs[1]: show("ACTIVE")
+with tabs[2]: show("TARGET HIT")
+with tabs[3]: show("STOPLOSS HIT")
+
+# =========================
+# ANALYTICS
+# =========================
 
 with tabs[4]:
-    st.dataframe(pd.DataFrame(sl_hit), use_container_width=True)
+    df = pd.read_sql("SELECT * FROM trades", conn)
 
-st.caption("🔄 Live NSE prices | Risk-based position sizing")
+    total = len(df)
+    wins = len(df[df.status == "TARGET HIT"])
+    losses = len(df[df.status == "STOPLOSS HIT"])
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Total Trades", total)
+    c2.metric("Targets Hit", wins)
+    c3.metric("Stoploss Hit", losses)
+
+    if total:
+        c4.metric("Win Rate", f"{round(wins/total*100,1)}%")
+
+# =========================
+# FOOTER
+# =========================
+
+st.caption("Manual refresh Kite-style Trading Dashboard")
