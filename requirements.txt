@@ -3,5 +3,6 @@ pandas
 numpy
 requests
 yfinance
-pip install git+https://github.com/rongardF/tvdatafeed.git
+git+https://github.com/rongardF/tvdatafeed.git
+
 
